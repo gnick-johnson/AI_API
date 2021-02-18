@@ -4,7 +4,7 @@ Author: Nick Johnson
 Date created: 2/9/2021
 Last modified: 2/17/2021 
 Description: redis and keras server processes for artistic style transfer implementation
-(a work in progress, exercise in understanding and explicating ai web services)
+(a work in progress)
 
 **References**
 [Server implementation adapted from Adrian Rosebrock](
@@ -174,7 +174,7 @@ def total_variation_loss(x):
 
 
 """
-## function for the computation of style loss from our references image
+## computation of style loss from our references image
 """
 
 
