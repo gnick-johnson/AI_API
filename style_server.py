@@ -322,8 +322,6 @@ def generator():
 
 @app.route("/generate", methods=["POST"])
 def generate():
-        # generte is used inside of read_image() to gerate the style transfered output
-        # initialize the data dictionary that will be returned from the view
 	data = {"success": False}
 
         # if image uploaded to endpoint
