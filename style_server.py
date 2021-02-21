@@ -2,9 +2,9 @@
 Title: style_server.py 
 Author: Nick Johnson
 Date created: 2/9/2021
-Last modified: 2/17/2021 
+Last modified: 2/21/2021 
 Description: redis and keras server processes for artistic style transfer implementation
-(a work in progress)
+(a work in progress, exercise in understanding and explicating ai web services)
 
 **References**
 [Server implementation adapted from Adrian Rosebrock](
@@ -22,7 +22,6 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras.applications import vgg19
-# consider more lightweight networks
 from threading import Thread
 from PIL import Image
 import numpy as np
@@ -41,7 +40,7 @@ import io
 """
 
 # server queuing
-IMAwGE_QUEUE = "image_queue"
+IMAGE_QUEUE = "image_queue"
 BATCH_SIZE = 32
 SERVER_SLEEP = 0.25
 CLIENT_SLEEP = 0.25
@@ -56,9 +55,6 @@ width, height = keras.preprocessing.image.load_img(base_image_path).size
 img_nrows = 400
 img_ncols = int(width * img_nrows / height)
 
-# compatibility attributes
-# IMAGE_WIDTH = 224
-# IMAGE_HEIGHT = 224
 IMAGE_CHANS = 3
 IMAGE_DTYPE = "float32"
 
@@ -125,7 +121,7 @@ def deprocess_image(x):
 
 
 '''
-## Utility functions
+## image network utilities
 '''
 
 
@@ -173,11 +169,6 @@ def total_variation_loss(x):
     return tf.reduce_sum(tf.pow(a + b, 1.25))
 
 
-"""
-## computation of style loss from our references image
-"""
-
-
 # List of layers to use for the style loss.
 style_layer_names = [
     "block1_conv1",
@@ -186,6 +177,8 @@ style_layer_names = [
     "block4_conv1",
     "block5_conv1",
 ]
+
+
 # The layer to use for the content loss.
 content_layer_name = "block5_conv2"
 
@@ -221,21 +214,22 @@ def compute_loss(combination_image, base_image, style_reference_image):
     return loss
 
 
-"""
-## Functions for processing / generation of images
-"""
+
+@tf.function # compiling loss and gradiat function
+def compute_loss_and_grads(combination_image, base_image, style_reference_image):
+    with tf.GradientTape() as tape:
+        loss = compute_loss(combination_image, base_image, style_reference_image)
+    grads = tape.gradient(loss, combination_image)
+    return loss, grads
 
 
 
-######################################################~~
-# working/bookmark ~ scratch below   #################~~
-######################################################~~
+'''
+## start filling flask from redis store for processing
+'''
 
  
-def image_read():
-        '''
-calculate the style and content loss of each image sent to server
-'''
+def generator():
                 
         # Build a VGG19 model loaded with pre-trained ImageNet weights
         model = vgg19.VGG19(weights="imagenet", include_top=False)
@@ -247,6 +241,13 @@ calculate the style and content loss of each image sent to server
         # VGG19 (as a dict).
         feature_extractor = keras.Model(inputs=model.inputs, outputs=outputs_dict)
 
+        # can likely be moved outside of this function but should 
+        optimizer = keras.optimizers.SGD(
+                keras.optimizers.schedules.ExponentialDecay(
+                        initial_learning_rate=100.0, decay_steps=100, decay_rate=0.96
+                )
+        )
+        
 	# listen for images to process
 	while True:
 		# attempt to grab a batch of images from the database, then
@@ -255,36 +256,121 @@ calculate the style and content loss of each image sent to server
 		imageIDs = []
 		batch = None
 		# loop over the queue
-		for q in queue:
+		for q, r, s in queue:
 			# deserialize the object and obtain the input image
 			q = json.loads(q.decode("utf-8"))
-			image = base64_decode_image(q["image"], IMAGE_DTYPE,
-				(1, IMAGE_HEIGHT, IMAGE_WIDTH, IMAGE_CHANS))
+                        r = json.loads(r.decode("utf-8"))
+                        s = json.loads(s.decode("utf-8"))
+                        
+                        ##-->> change image contasts to style server congruent
+			base_image = base64_decode_image(q["image"], IMAGE_DTYPE,
+				(1, height, width, IMAGE_CHANS))
+                        style_reference_image = base64_decode_image(r["image"], IMAGE_DTYPE,
+				(1, height, width, IMAGE_CHANS))
+                        combination_image = base64_decode_image(s["image"], IMAGE_DTYPE,
+				(1, height, width, IMAGE_CHANS))
+                                                
 			# check to see if the batch list is None
 			if batch is None:
 				batch = image
 			# otherwise, stack the data
 			else:
-				batch = np.vstack([batch, image])
+				batch = np.vstack([batch, image])  # REVIEW NP STACK
 			# update the list of image IDs
 			imageIDs.append(q["id"])
+
+		# check to see if we need to generate the batch
+		if len(imageIDs) > 0:
+			# classify the batch
+			print("* Batch size: {}".format(batch.shape))
+
+                        ### return a picture from generate() funcion
+                        ###  we are returning pictures, not predictions..
+                        ## results = model.generate(batch)
+                        iterations = 4000
+                        for i in range(1, iterations + 1):
+                                loss, grads = compute_loss_and_grads(
+                                        combination_image, base_image, style_reference_image
+                                )
+                                optimizer.apply_gradients([(grads, combination_image)])
+                                if i % 100 == 0:
+                                        print("Iteration %d: loss=%.2f" % (i, loss))
+                                        img = deprocess_image(combination_image.numpy())
+                                        fname = result_prefix + "_at_iteration_%d.png" % i
+                                        # keras.preprocessing.image.save_img(fname, img)
+                        
+
+			# loop over the image IDs and their corresponding set of
+			# results from our model
+			for (imageID, resultSet) in zip(imageIDs, results):
+				# initialize the list of output predictions
+				output = []
+				# loop over the results and add them to the list of
+				# output predictions
+				for (imagenetID, label, prob) in resultSet:
+					r = {"label": label, "probability": float(prob)}
+					output.append(r)
+				# store the output predictions in the database, using
+				# the image ID as the key so we can fetch the results
+				db.set(imageID, json.dumps(output))
+			# remove the set of images from our queue
+			db.ltrim(IMAGE_QUEUE, len(imageIDs), -1)
+		# sleep for a small amount
+		time.sleep(SERVER_SLEEP)
 
         
 
 @app.route("/generate", methods=["POST"])
 def generate():
+        # generte is used inside of read_image() to gerate the style transfered output
         # initialize the data dictionary that will be returned from the view
 	data = {"success": False}
 
         # if image uploaded to endpoint
         # need to edit for two-image-input?
-	if flask.request.method == "POST":
-		if flask.request.files.get("image"):
-			# read the image in PIL format and prepare it for
-			# classification
+	if flask.request.method == "POST":  # handling both base and style ref imgs?
+		if flask.request.files.get("image"): 
+			# read the images in PIL format and preprocess
+                        base_image = preprocess_image(base_image_path)
+                        style_reference_image = preprocess_image(style_reference_image_path)
+                        combination_image = tf.Variable(preprocess_image(base_image_path))
+                        
 			image = flask.request.files["image"].read()
 			image = Image.open(io.BytesIO(image))
+			image = prepare_image(image, (IMAGE_WIDTH, IMAGE_HEIGHT))
+			# ensure our NumPy array is C-contiguous as well,
+			# otherwise we won't be able to serialize it
+			image = image.copy(order="C")
+			# generate an ID for the classification then add the
+			# classification ID + image to the queue
+			k = str(uuid.uuid4())
+			d = {"id": k, "image": base64_encode_image(image)}
+			db.rpush(IMAGE_QUEUE, json.dumps(d))
 
+			# keep looping until our model server returns the output
+			# predictions
+			while True:
+				# attempt to grab the output predictions
+				output = db.get(k)
+				# check to see if our model has classified the input
+				# image
+				if output is not None:
+ 					# add the output predictions to our data
+ 					# dictionary so we can return it to the client
+					output = output.decode("utf-8")
+					data["predictions"] = json.loads(output)
+					# delete the result from the database and break
+					# from the polling loop
+					db.delete(k)
+					break
+				# sleep for a small amount to give the model a chance
+				# to classify the input image
+				time.sleep(CLIENT_SLEEP)
+			# indicate that the request was a success
+			data["success"] = True
+	# return the data dictionary as a JSON response
+	return flask.jsonify(data)
+ 
 
 '''
 ## load the model, start the server
@@ -294,14 +380,13 @@ if __name__ == "__main__":
 	# load the function used to classify input images in a *separate*
 	# thread than the one used for main classification
 	print("* Starting model service...")
-	t = Thread(target=classify_process, args=())
+	t = Thread(target=generator, args=())
 	t.daemon = True
 	t.start()
 	# start the web server
 	print("* Starting web service...")
 	app.run()
-
-        
+ 
 
         
                         
